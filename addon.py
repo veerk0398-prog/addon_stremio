@@ -1612,21 +1612,35 @@ async def tg_subtitle_proxy(
 async def tg_stream_proxy(
     chat_id: str, message_id: int, filename: str, request: Request, api_key: str = ""
 ):
+    """
+    Stream a Telegram media file using bounded HTTP ranges.
+
+    IMPORTANT:
+    Some players (especially over a remote proxy such as Railway) may request
+    a huge byte range, potentially the entire file. We must NOT keep one
+    Telegram stream open while copying gigabytes through a single response.
+
+    Instead, every HTTP request is capped to STREAM_RESPONSE_CHUNK bytes.
+    The player will request the next byte range itself.
+    """
     if Config.API_KEY and api_key != Config.API_KEY:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
+    # Fetch a fresh Telegram message reference.
     try:
         try:
             chat_id_val = int(chat_id)
         except ValueError:
             chat_id_val = chat_id
-        # Get fresh message reference for streaming
+
         try:
             msg = await tg_client_manager.client.get_messages(
                 chat_id=chat_id_val, message_ids=message_id
             )
         except Exception:
-            msg = await tg_client_manager.get_message(message_id, chat_id=chat_id_val)
+            msg = await tg_client_manager.get_message(
+                message_id, chat_id=chat_id_val
+            )
     except Exception as e:
         logger.error(f"Proxy failed to fetch message: {e}")
         raise HTTPException(status_code=404, detail="Media file not found")
@@ -1640,70 +1654,118 @@ async def tg_stream_proxy(
             status_code=404, detail="No playable media found in message"
         )
 
-    file_size = media.file_size
+    file_size = int(media.file_size or 0)
     mime_type = media.mime_type or "video/mp4"
+
+    if file_size <= 0:
+        raise HTTPException(status_code=404, detail="Media file has no size")
 
     if request.method == "GET":
         asyncio.create_task(
             tg_client_manager.send_play_log(filename, chat_id_val, message_id)
         )
 
-    range_header = request.headers.get("Range")
+    # Keep Telegram reads bounded. The player controls subsequent ranges.
+    STREAM_RESPONSE_CHUNK = 8 * 1024 * 1024  # 8 MiB
+
+    range_header = request.headers.get("Range", "").strip()
     start = 0
-    end = file_size - 1
+    requested_end = file_size - 1
+    has_range = False
 
     if range_header:
+        has_range = True
         try:
-            bytes_range = range_header.replace("bytes=", "").split("-")
-            if bytes_range[0]:
-                start = int(bytes_range[0])
-            if len(bytes_range) > 1 and bytes_range[1]:
-                end = int(bytes_range[1])
-        except ValueError:
-            pass
+            if not range_header.lower().startswith("bytes="):
+                raise ValueError("Invalid range unit")
 
+            range_value = range_header[6:].split(",", 1)[0].strip()
+            range_parts = range_value.split("-", 1)
+
+            if len(range_parts) != 2:
+                raise ValueError("Invalid range")
+
+            left, right = range_parts
+
+            if left:
+                start = int(left)
+                if start >= file_size:
+                    headers = {
+                        "Content-Range": f"bytes */{file_size}",
+                        "Accept-Ranges": "bytes",
+                    }
+                    return Response(status_code=416, headers=headers)
+
+                if right:
+                    requested_end = min(int(right), file_size - 1)
+                else:
+                    requested_end = file_size - 1
+            else:
+                # Suffix range: bytes=-N
+                suffix_length = int(right)
+                if suffix_length <= 0:
+                    raise ValueError("Invalid suffix range")
+                start = max(0, file_size - suffix_length)
+                requested_end = file_size - 1
+
+            if requested_end < start:
+                raise ValueError("Invalid range")
+        except (ValueError, TypeError):
+            headers = {
+                "Content-Range": f"bytes */{file_size}",
+                "Accept-Ranges": "bytes",
+            }
+            return Response(status_code=416, headers=headers)
+
+    # Never serve more than STREAM_RESPONSE_CHUNK from one HTTP request.
+    end = min(requested_end, start + STREAM_RESPONSE_CHUNK - 1)
     content_length = end - start + 1
 
     chunk_size = 1024 * 1024
-    offset = start // chunk_size
+    telegram_offset = start // chunk_size
     skip_bytes = start % chunk_size
+
+    status_code = 206 if has_range else 200
 
     headers = {
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
         "Content-Disposition": f'inline; filename="{filename}"',
-        "Connection": "keep-alive",
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
         "X-Accel-Buffering": "no",
     }
 
-    # Content-Range must only be sent on 206
-    status_code = 200
-    if range_header:
-        status_code = 206
+    if has_range:
         headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
 
     if request.method == "HEAD":
         logger.info(
-            f"HEAD request for media '{filename}' (bytes {start}-{end}/{file_size}) - Status {status_code}"
+            f"HEAD request for media '{filename}' "
+            f"(bytes {start}-{end}/{file_size}) - Status {status_code}"
         )
-        return Response(status_code=status_code, media_type=mime_type, headers=headers)
+        return Response(
+            status_code=status_code,
+            media_type=mime_type,
+            headers=headers,
+        )
 
     async def file_generator():
         nonlocal msg
+
         bytes_sent = 0
         bytes_to_skip = skip_bytes
+        current_offset = telegram_offset
         retry_count = 0
         max_retries = 2
-        current_offset = offset
 
         while retry_count <= max_retries:
             try:
-                # Stream using message object
                 async for chunk in tg_client_manager.client.stream_media(
-                    msg, offset=current_offset
+                    msg,
+                    offset=current_offset,
                 ):
-                    if bytes_to_skip > 0:
+                    if bytes_to_skip:
                         if bytes_to_skip < len(chunk):
                             chunk = chunk[bytes_to_skip:]
                             bytes_to_skip = 0
@@ -1711,53 +1773,84 @@ async def tg_stream_proxy(
                             bytes_to_skip -= len(chunk)
                             continue
 
-                    if bytes_sent + len(chunk) > content_length:
-                        chunk = chunk[: content_length - bytes_sent]
+                    remaining = content_length - bytes_sent
+                    if remaining <= 0:
+                        break
+
+                    if len(chunk) > remaining:
+                        chunk = chunk[:remaining]
+
+                    if not chunk:
+                        continue
 
                     yield chunk
                     bytes_sent += len(chunk)
 
                     if bytes_sent >= content_length:
                         break
-                # Stream completed successfully
-                break
+
+                if bytes_sent >= content_length:
+                    return
+
+                # Telegram ended unexpectedly before the bounded range was sent.
+                raise RuntimeError(
+                    f"Telegram stream ended early: sent "
+                    f"{bytes_sent}/{content_length} bytes"
+                )
+
             except asyncio.CancelledError:
-                logger.info(f"Streaming cancelled by client for message {message_id}")
-                break
+                logger.info(
+                    f"Streaming cancelled by client for message {message_id}"
+                )
+                return
+
             except Exception as e:
                 err_str = str(e).upper()
                 is_expired = (
                     "FILEREFERENCEEXPIRED" in type(e).__name__.upper()
                     or "FILE_REFERENCE" in err_str
                 )
+
                 if is_expired and retry_count < max_retries:
                     retry_count += 1
                     logger.warning(
-                        f"File reference expired for message {message_id}, refreshing and retrying ({retry_count}/{max_retries})"
+                        f"File reference expired for message {message_id}, "
+                        f"refreshing and retrying ({retry_count}/{max_retries})"
                     )
+
                     try:
                         msg = await tg_client_manager.client.get_messages(
-                            chat_id=chat_id_val, message_ids=message_id
+                            chat_id=chat_id_val,
+                            message_ids=message_id,
                         )
+
                         total_bytes_streamed = start + bytes_sent
                         current_offset = total_bytes_streamed // chunk_size
                         bytes_to_skip = total_bytes_streamed % chunk_size
                         continue
+
                     except Exception as refresh_err:
                         logger.error(
-                            f"Failed to refresh message for reference recovery: {refresh_err}"
+                            "Failed to refresh message for reference recovery: "
+                            f"{refresh_err}"
                         )
-                        break
-                else:
-                    logger.error(f"Streaming error on message {message_id}: {e}")
-                    break
+                        return
+
+                logger.error(
+                    f"Streaming error on message {message_id}: {e}"
+                )
+                return
 
     logger.info(
-        f"Streaming media '{filename}' (bytes {start}-{end}/{file_size}) - Status {status_code}"
+        f"Streaming media '{filename}' "
+        f"(bytes {start}-{end}/{file_size}) - Status {status_code}"
     )
 
     return StreamingResponse(
-        file_generator(), status_code=status_code, media_type=mime_type, headers=headers
+        file_generator(),
+        status_code=status_code,
+        media_type=mime_type,
+        headers=headers,
     )
 
 
